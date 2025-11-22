@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AA変換ツール：シンプル版</title>
+    <style>
+        :root {
+            --bg-color: #111;
+            --panel-bg: #222;
+            --text-color: #ddd;
+            --accent-color: #00E676; /* 鮮やかな緑 */
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: sans-serif;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden; /* 全体スクロール禁止 */
+        }
+
+        /* コントロールパネル */
+        .controls {
+            background-color: var(--panel-bg);
+            padding: 10px 15px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            border-bottom: 1px solid #444;
+            z-index: 100;
+            box-shadow: 0 0 10px rgba(0,0,0,0.5);
+            flex-shrink: 0;
+        }
+
+        .group {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            background: #333;
+            padding: 4px 8px;
+            border-radius: 4px;
+        }
+
+        label { font-size: 12px; color: #aaa; font-weight: bold; }
+
+        input, select {
+            background: #222;
+            border: 1px solid #555;
+            color: white;
+            padding: 4px;
+            border-radius: 3px;
+            font-size: 13px;
+        }
+
+        button {
+            background: var(--accent-color);
+            color: #000;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-weight: bold;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        button:disabled { background: #555; color: #888; cursor: not-allowed; }
+        button.secondary { background: #444; color: white; }
+
+        /* ビューワーエリア */
+        #viewer {
+            flex-grow: 1;
+            position: relative;
+            background: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden; /* ここからはみ出させない */
+            width: 100%;
+            height: 100%;
+        }
+
+        /* アスキーアートのラッパー（ここを変形させる） */
+        #aa-wrapper {
+            transform-origin: center center; /* 真ん中基準で縮小 */
+            /* 初期状態では見えないようにしておく */
+            opacity: 0; 
+            transition: opacity 0.3s;
+        }
+
+        /* アスキーアート本体 */
+        #ascii-art {
+            font-family: "Courier New", Consolas, monospace;
+            /* フォントサイズ固定！これをscaleで縮小して見せる */
+            font-size: 10px; 
+            line-height: 10px; /* 行間を詰める */
+            white-space: pre;
+            font-weight: bold;
+            background: #000;
+            display: block;
+        }
+
+        /* 画像生成用キャンバス（非表示） */
+        canvas { display: none; }
+
+        .loading {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: var(--accent-color);
+            display: none;
+        }
+    </style>
+</head>
+<body>
+
+<div class="controls">
+    <div class="group">
+        <label>画像</label>
+        <input type="file" id="inp-file" accept="image/*">
+    </div>
+    <div class="group">
+        <label>横幅(文字数)</label>
+        <input type="number" id="inp-width" value="150" min="20" max="4000">
+    </div>
+    <div class="group">
+        <label>モード</label>
+        <select id="inp-mode">
+            <option value="mono">モノクロ</option>
+            <option value="color">カラー (重いです)</option>
+        </select>
+    </div>
+    <div class="group">
+        <label>文字セット</label>
+        <select id="inp-charset">
+            <option value="std">標準 (記号)</option>
+            <option value="num">数字のみ (0-9)</option>
+        </select>
+    </div>
+    <button id="btn-convert" disabled>変換実行</button>
+    <button id="btn-copy" class="secondary" disabled>テキストコピー</button>
+    <button id="btn-dl" class="secondary" disabled>画像DL</button>
+</div>
+
+<div id="viewer">
+    <div class="loading" id="loading-msg">変換中...</div>
+    <!-- ここにAAが入る -->
+    <div id="aa-wrapper">
+        <div id="ascii-art"></div>
+    </div>
+</div>
+
+<!-- 処理用キャンバス -->
+<canvas id="work-canvas"></canvas>
+
+<script>
+    // 要素取得
+    const inpFile = document.getElementById('inp-file');
+    const inpWidth = document.getElementById('inp-width');
+    const inpMode = document.getElementById('inp-mode');
+    const inpCharset = document.getElementById('inp-charset');
+    const btnConvert = document.getElementById('btn-convert');
+    const btnCopy = document.getElementById('btn-copy');
+    const btnDl = document.getElementById('btn-dl');
+    
+    const viewer = document.getElementById('viewer');
+    const aaWrapper = document.getElementById('aa-wrapper');
+    const asciiArt = document.getElementById('ascii-art');
+    const canvas = document.getElementById('work-canvas');
+    const ctx = canvas.getContext('2d');
+    const loadingMsg = document.getElementById('loading-msg');
+
+    let currentImg = null;
+    let rawTextData = "";
+
+    // 文字セット (左が暗い/黒、右が明るい/白)
+    // 背景黒なので、明るいピクセルには「密度の高い文字」を割り当てる必要がある
+    const CHARSETS = {
+        // 標準: 濃淡がはっきり出る記号セット
+        std: " .:-=+*#%@".split(""), 
+        // 数字のみ: デジタル感が出る
+        num: " 1234567890".split("")
+    };
+
+    // --- 1. 画像読み込み ---
+    inpFile.addEventListener('change', e => {
+        const f = e.target.files[0];
+        if(!f) return;
+        const reader = new FileReader();
+        reader.onload = ev => {
+            const img = new Image();
+            img.onload = () => {
+                currentImg = img;
+                btnConvert.disabled = false;
+                btnConvert.innerText = "変換実行";
+            };
+            img.src = ev.target.result;
+        };
+        reader.readAsDataURL(f);
+    });
+
+    // --- 2. 変換処理 ---
+    btnConvert.addEventListener('click', () => {
+        if(!currentImg) return;
+        
+        // ローディング表示
+        loadingMsg.style.display = 'block';
+        aaWrapper.style.opacity = '0';
+        
+        setTimeout(execConvert, 50);
+    });
+
+    function execConvert() {
+        const width = parseInt(inpWidth.value);
+        const mode = inpMode.value; // mono or color
+        const chars = CHARSETS[inpCharset.value];
+
+        // アスペクト比補正 (文字の縦伸びを防ぐため0.5倍)
+        const ASPECT_CORRECTION = 0.5; 
+        const ratio = currentImg.height / currentImg.width;
+        const height = Math.floor(width * ratio * ASPECT_CORRECTION);
+
+        // キャンバス設定
+        canvas.width = width;
+        canvas.height = height;
+        ctx.drawImage(currentImg, 0, 0, width, height);
+
+        // ピクセル取得
+        const imgData = ctx.getImageData(0, 0, width, height);
+        const data = imgData.data;
+
+        let txt = "";
+        let html = "";
+
+        for(let y=0; y<height; y++) {
+            for(let x=0; x<width; x++) {
+                const i = (y * width + x) * 4;
+                const r = data[i];
+                const g = data[i+1];
+                const b = data[i+2];
+                // 輝度
+                const bri = (0.299*r + 0.587*g + 0.114*b);
+                
+                // 文字選択
+                const idx = Math.floor((bri / 255) * (chars.length - 1));
+                const char = chars[idx];
+
+                txt += char;
+
+                if(mode === 'color') {
+                    html += `<span style="color:rgb(${r},${g},${b})">${char}</span>`;
+                } else {
+                    html += char;
+                }
+            }
+            txt += "
+";
+            html += "
+";
+        }
+
+        // 描画
+        asciiArt.innerHTML = html;
+        if(mode === 'mono') asciiArt.style.color = 'white';
+        else asciiArt.style.color = ''; 
+
+        rawTextData = txt;
+
+        // 完了後の調整
+        loadingMsg.style.display = 'none';
+        aaWrapper.style.opacity = '1';
+        btnCopy.disabled = false;
+        btnDl.disabled = false;
+
+        fitToScreen(width, height);
+    }
+
+    // --- 3. 画面フィット (Scale方式) ---
+    function fitToScreen(cols, rows) {
+        const CHAR_W = 6.0; // Courier New 10px幅
+        const CHAR_H = 10.0; // 高さ
+
+        const naturalW = cols * CHAR_W;
+        const naturalH = rows * CHAR_H;
+
+        const viewW = viewer.clientWidth - 40; 
+        const viewH = viewer.clientHeight - 40;
+
+        const scaleX = viewW / naturalW;
+        const scaleY = viewH / naturalH;
+        const scale = Math.min(scaleX, scaleY);
+
+        aaWrapper.style.width = naturalW + "px";
+        aaWrapper.style.height = naturalH + "px";
+        aaWrapper.style.transform = `scale(${scale})`;
+    }
+
+    window.addEventListener('resize', () => {
+        if(rawTextData) {
+            const w = parseInt(inpWidth.value);
+            const h = rawTextData.split('
+').length - 1;
+            if(w && h) fitToScreen(w, h);
+        }
+    });
+
+
+    // --- 4. コピー機能 ---
+    btnCopy.addEventListener('click', () => {
+        navigator.clipboard.writeText(rawTextData).then(() => alert("コピーしました"));
+    });
+
+
+    // --- 5. 画像ダウンロード ---
+    btnDl.addEventListener('click', () => {
+        if(!rawTextData) return;
+
+        const dlCanvas = document.createElement('canvas');
+        const dlCtx = dlCanvas.getContext('2d');
+        
+        const lines = rawTextData.split('
+');
+        if(lines[lines.length-1] === "") lines.pop();
+
+        const cols = lines[0].length;
+        const rows = lines.length;
+
+        // 解像度制限 (最大幅4000px)
+        let fontSize = 12;
+        const MAX_WIDTH_PX = 4000;
+        if (cols * (fontSize * 0.6) > MAX_WIDTH_PX) {
+            fontSize = Math.max(4, Math.floor(MAX_WIDTH_PX / (cols * 0.6))); 
+        }
+
+        const charW = fontSize * 0.6;
+        const charH = fontSize;
+
+        dlCanvas.width = Math.ceil(cols * charW) + 20;
+        dlCanvas.height = Math.ceil(rows * charH) + 20;
+
+        dlCtx.fillStyle = "black";
+        dlCtx.fillRect(0, 0, dlCanvas.width, dlCanvas.height);
+
+        dlCtx.font = `bold ${fontSize}px "Courier New", monospace`;
+        dlCtx.fillStyle = "white";
+        dlCtx.textBaseline = "top";
+
+        lines.forEach((line, i) => {
+            dlCtx.fillText(line, 10, 10 + (i * charH));
+        });
+
+        const link = document.createElement('a');
+        link.download = `aa_${Date.now()}.png`;
+        link.href = dlCanvas.toDataURL('image/png');
+        link.click();
+    });
+
+</script>
+
+</body>
+</html>
